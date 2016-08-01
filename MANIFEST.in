@@ -1,0 +1,2 @@
+include versioneer.py
+include storm/bolt/_version.py
