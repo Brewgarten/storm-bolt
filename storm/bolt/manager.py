@@ -5,28 +5,26 @@ This utility provides functionality to provision and configure clusters
 """
 from __future__ import print_function
 
-import ConfigParser
 import argparse
 import logging
-import os
 import sys
-import time
 
 from libcloud.compute.base import NodeDriver
 from libcloud.compute.providers import get_driver
 from prettytable import PrettyTable
 
+from c4.utils.logutil import ClassLogger
 from c4.utils.util import getModuleClasses
-from storm.thunder.base import NodesInfoMap
+
+from .configuration import (ConfigurationInfo, ClusterInfo)
+from storm.thunder import (NodesInfoMap,
+                           deploy)
+from storm.thunder.manager import getDeploymentSections
 
 
 log = logging.getLogger(__name__)
 
-DEFAULT_CPUS = 2
-DEFAULT_IMAGE_ID = "centos-7.2"
-DEFAULT_NUMBER_OF_NODES = 3
-DEFAULT_RAM = 2048
-
+@ClassLogger
 class Bolt(object):
     """
     A cloud manager implementation that utilizes the specified driver
@@ -41,12 +39,14 @@ class Bolt(object):
     def createCluster(
             self,
             cluster=None,
-            cpus=DEFAULT_CPUS,
+            clusterInfo=None,
+            cpus=None,
             disks=None,
-            imageId=DEFAULT_IMAGE_ID,
+            imageId=None,
+            locationId=None,
             nodes=None,
-            numberOfNodes=DEFAULT_NUMBER_OF_NODES,
-            ram=DEFAULT_RAM
+            numberOfNodes=None,
+            ram=None
         ):
         """
         Create a new cluster. All nodes in this cluster will be started
@@ -54,12 +54,16 @@ class Bolt(object):
 
         :param cluster: cluster name
         :type cluster: str
+        :param clusterInfo: cluster info
+        :type clusterInfo: :class:`~storm.bolt.configuration.ClusterInfo`
         :param cpus: number of cpus per node
         :type cpus: int
         :param disks: list of disks capacities in GB
         :type disks: list
         :param imageId: id of the image to use for the nodes
         :type imageId: str
+        :param locationId: id of the location to use for the nodes
+        :type locationId: str
         :param nodes: list of node names
         :type nodes: []
         :param numberOfNodes: number of nodes
@@ -67,40 +71,64 @@ class Bolt(object):
         :param ram: ram in MB per node
         :type ram: int
         """
-        if not cluster:
-            cluster = "{}-{}".format(os.getlogin(), int(time.time()))
-        log.info("Using cluster name '%s'", cluster)
+        # use cluster info object as base and then overwrite with parameters
+        if not clusterInfo:
+            clusterInfo = ClusterInfo()
 
-        # if specified use node names otherwise generate them
-        if not nodes:
-            nodes = [
-                "node{}".format(i+1)
-                for i in range(numberOfNodes)
-            ]
-        log.info("Using node names '%s'", ",".join(nodes))
+        if cluster:
+            clusterInfo.name = cluster
+        self.log.info("Using cluster name '%s'", clusterInfo.name)
 
-        image = self.driver.get_image(imageId)
+        if cpus:
+            clusterInfo.cpus = cpus
+        if disks:
+            # include the default OS disk in the size
+            clusterInfo.disks = [100] + disks
+
+        if imageId:
+            clusterInfo.image = imageId
+        image = self.driver.get_image(clusterInfo.image)
         if not image:
             log.error("Could not find image with id '%s'", imageId)
             return None
-        log.info("Using image '%s'", image.name)
+        self.log.info("Using image '%s'", image.name)
 
-        # include the default OS disk in the size
-        if disks:
-            disks = [100] + disks
-        else:
-            disks = [100]
-        size = self.driver.ex_get_size_by_attributes(cpus, ram, disks)
+        if locationId:
+            clusterInfo.location = locationId
+        location = None
+        for availableLocation in self.driver.list_locations():
+            if availableLocation.id == clusterInfo.location:
+                location = availableLocation
+        if not location:
+            log.error("Could not find location with id '%s'", locationId)
+            return None
+        self.log.info("Using location '%s'", location.name)
+
+        if nodes:
+            clusterInfo.nodes = nodes
+            clusterInfo.numberOfNodes = len(nodes)
+        elif numberOfNodes:
+            clusterInfo.nodes = [
+                "node{}".format(i+1)
+                for i in range(numberOfNodes)
+            ]
+            clusterInfo.numberOfNodes = numberOfNodes
+        self.log.info("Using node names '%s'", ",".join(clusterInfo.nodes))
+
+        if ram:
+            clusterInfo.ram = ram
+        size = self.driver.ex_get_size_by_attributes(clusterInfo.cpus, clusterInfo.ram, clusterInfo.disks)
         if not size:
             log.error("Could not find size with '%d' cpus, '%d' ram and '%s' disks",
                       cpus, ram, ",".join(str(capacity for capacity in disks)))
             return None
-        log.info("Using size '%s'", size.name)
+        self.log.info("Using size '%s'", size.name)
 
         return self.driver.ex_create_cluster(
-            cluster=cluster,
+            cluster=clusterInfo.name,
             image=image,
-            names=nodes,
+            location=location,
+            names=clusterInfo.nodes,
             size=size
         )
 
@@ -236,7 +264,7 @@ class Bolt(object):
                                node.private_ips[0] if node.private_ips else "",
                                node.extra.get("password", "unknown"),
                                node.state,
-                               ",".join(str(capacity) for capacity in node.extra.get('disks'))])
+                               ",".join(str(capacity) for capacity in node.size.diskCapacities)])
             print(table)
 
     def listSizes(self, includeExtras=False):
@@ -279,8 +307,6 @@ def main():
         ])
     except ImportError:
         pass
-    for driverType in sorted(driverTypes):
-        log.info("Found storm cloud driver '%s'", driverType)
     if not driverTypes:
         log.error("Could not find any storm cloud drivers. Please install at least one.")
         return 1
@@ -305,17 +331,19 @@ def main():
                                      help="cluster configuration")
     createClusterParser.add_argument("--cluster", action="store", type=str,
                                      help="cluster name")
-    createClusterParser.add_argument("--image", action="store", type=str, default=DEFAULT_IMAGE_ID,
-                                     help="image to be used for the nodes")
-    createClusterParser.add_argument("--nodes", action="store", type=int, default=DEFAULT_NUMBER_OF_NODES,
-                                     dest="numberOfNodes",
-                                     help="number of nodes")
-    createClusterParser.add_argument("--disk", action="append", type=int, default=[],
+    createClusterParser.add_argument("--cpus", action="store", type=int,
+                                     help="number of cpus per node")
+    createClusterParser.add_argument("--disk", action="append", type=int,
                                      dest="disks",
                                      help="disk size in GB. This option can be supplied more than once. Default is 1 disk of 100 GB")
-    createClusterParser.add_argument("--cpus", action="store", type=int, default=2,
-                                     help="number of cpus per node")
-    createClusterParser.add_argument("--ram", action="store", type=int, default=2048,
+    createClusterParser.add_argument("--image", action="store", type=str,
+                                     help="image to be used for the nodes")
+    createClusterParser.add_argument("--location", action="store", type=str,
+                                     help="location to be used for the nodes")
+    createClusterParser.add_argument("--nodes", action="store", type=int,
+                                     dest="numberOfNodes",
+                                     help="number of nodes")
+    createClusterParser.add_argument("--ram", action="store", type=int,
                                      help="amount of ram per node in MB")
     createClusterParser.add_argument("nodes", nargs="*", default=[], type=str,
                                      help="node names")
@@ -361,44 +389,29 @@ def main():
 
     args = parser.parse_args()
 
-    # TODO: implement Driver.fromConfigFile() in the drivers instead of hard coding this
-    if args.driver == "fyre":
-        config = ConfigParser.ConfigParser()
+    # TODO: move into fyre driver
+    # disable HTTPS certificate warnings
+    import requests.packages.urllib3
+    requests.packages.urllib3.disable_warnings()
+
+    try:
+        cls = get_driver(args.driver)
         if args.driverConfig:
-            config.read(os.path.expanduser(args.driverConfig))
+            driver = cls.ex_from_config(configFileName=args.driverConfig)
         else:
-            config.read(os.path.expanduser("~/.fyre"))
-        cls = get_driver("fyre")
-        driver = cls(config.get("fyre", "username"), config.get("fyre", "api_key"), config.get("fyre", "endpoint_url"), config.get("fyre", "root_password"))
-        # TODO: move into fyre driver
-        # disable HTTPS certificate warnings
-        import requests.packages.urllib3
-        requests.packages.urllib3.disable_warnings()
-    elif args.driver == "softlayer":
-        config = ConfigParser.ConfigParser()
-        config = ConfigParser.ConfigParser()
-        if args.driverConfig:
-            config.read(os.path.expanduser(args.driverConfig))
-        else:
-            config.read(os.path.expanduser("~/.softlayer"))
-        cls = get_driver("SoftLayerPythonAPI")
-        driver = cls(config.get("softlayer", "username"), config.get("softlayer", "api_key"))
-    elif args.driver == "local":
-        cls = get_driver("local")
-        driver = cls()
-    else:
+            driver = cls.ex_from_config()
+    except Exception as exception:
+        log.error(exception)
         raise NotImplementedError
 
     bolt = Bolt(driver)
 
-    # TODO: adjust logging since this should not depend on anything specific
+    logging.root.setLevel(logging.ERROR)
     logging.getLogger("storm").setLevel(logging.INFO)
     logging.getLogger("storm.thunder.client.AdvancedSSHClient").setLevel(logging.INFO)
     logging.getLogger("c4.utils").setLevel(logging.INFO)
     logging.getLogger("paramiko").setLevel(logging.ERROR)
     logging.getLogger("requests").setLevel(logging.ERROR)
-#     logging.getLogger("softlayer").setLevel(logging.ERROR)
-#     logging.getLogger("SoftLayer").setLevel(logging.ERROR)
 
     if args.verbose > 0:
         logging.getLogger("storm").setLevel(logging.DEBUG)
@@ -408,31 +421,55 @@ def main():
         logging.getLogger("storm.thunder.client.AdvancedSSHClient").setLevel(logging.DEBUG)
         logging.getLogger("c4.utils").setLevel(logging.DEBUG)
     if args.verbose > 2:
-        pass
-#         logging.getLogger("softlayer").setLevel(logging.INFO)
-#         logging.getLogger("SoftLayer").setLevel(logging.INFO)
+        logging.root.setLevel(logging.INFO)
     if args.verbose > 3:
+        logging.root.setLevel(logging.DEBUG)
         logging.getLogger("paramiko").setLevel(logging.INFO)
         logging.getLogger("requests").setLevel(logging.INFO)
-#         logging.getLogger("softlayer").setLevel(logging.DEBUG)
-#         logging.getLogger("SoftLayer").setLevel(logging.DEBUG)
     if args.verbose > 4:
         logging.getLogger("paramiko").setLevel(logging.DEBUG)
         logging.getLogger("requests").setLevel(logging.DEBUG)
 
     if args.command == "create":
 
+        if args.config:
+            try:
+                config = args.config.read()
+                args.config.close()
+                if args.config.name.endswith(".json"):
+                    configurationInfo = ConfigurationInfo.fromJSON(config)
+                elif args.config.name.endswith(".storm"):
+                    configurationInfo = ConfigurationInfo.fromHjson(config)
+                else:
+                    log.error("Unknown config file format, please specify a '.json' or '.storm' file")
+                    return 1
+            except Exception as exception:
+                log.error(exception)
+                return 1
+        else:
+            configurationInfo = ConfigurationInfo()
+
         if args.type == "cluster":
             cluster = bolt.createCluster(
                 cluster=args.cluster,
+                clusterInfo=configurationInfo.cluster,
                 cpus=args.cpus,
                 disks=args.disks,
                 imageId=args.image,
+                locationId=args.location,
                 nodes=args.nodes,
                 numberOfNodes=args.numberOfNodes,
                 ram=args.ram)
             if not cluster:
                 return 1
+
+            nodesInformation = NodesInfoMap()
+            nodesInformation.addNodes(cluster.nodes.values())
+            for deploymentSection in getDeploymentSections(configurationInfo.deploymentInfos, nodesInformation):
+                deployments, nodes = deploymentSection
+                results = deploy(deployments, nodes)
+                if results.numberOfErrors:
+                    return results.numberOfErrors
 
         else:
             raise NotImplementedError
