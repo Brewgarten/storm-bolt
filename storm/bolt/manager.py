@@ -7,6 +7,7 @@ from __future__ import print_function
 
 import argparse
 import logging
+import os
 import sys
 
 from libcloud.compute.base import NodeDriver
@@ -124,13 +125,19 @@ class Bolt(object):
             return None
         self.log.info("Using size '%s'", size.name)
 
-        return self.driver.ex_create_cluster(
+        createdCluster = self.driver.ex_create_cluster(
             cluster=clusterInfo.name,
             image=image,
             location=location,
             names=clusterInfo.nodes,
             size=size
         )
+
+        if createdCluster:
+            self.log.debug("Cleaning up 'known_hosts' file")
+            cleanupKnownHosts(createdCluster.nodes.values())
+
+        return createdCluster
 
     def destroyCluster(self, *clusterNames):
         """
@@ -154,10 +161,12 @@ class Bolt(object):
                 log.error("Could not find cluster with name '%s'", clusterName)
                 return False
 
-        return all(
-            cluster.destroy()
-            for cluster in destroyClusters
-        )
+        successful = False
+        for cluster in destroyClusters:
+            successful = cluster.destroy()
+            cleanupKnownHosts(cluster.nodes.values())
+
+        return successful
 
     def destroyNode(self, *nodeNames):
         """
@@ -289,6 +298,33 @@ class Bolt(object):
                            size.diskCapacities,
                            size.extra])
         print(table)
+
+def cleanupKnownHosts(nodes):
+    """
+    Remove node ip addresses of the cluster from the `known_hosts` file to avoid
+    conflicting host keys on subsequent deployments
+
+    :param nodes: list of nodes
+    :type nodes: [:class:`~libcloud.compute.base.Node`]
+    """
+    # parse existing entries
+    knownHostsEntries = []
+    parsed = False
+    with open(os.path.expanduser("~/.ssh/known_hosts")) as knownHostsFile:
+        knownHosts = knownHostsFile.read()
+        for entry in knownHosts.splitlines():
+            # only keep the known hosts entries that are not part of the cluster
+            if entry and not any([
+                node.public_ips[0] in entry
+                for node in nodes
+            ]): knownHostsEntries.append(entry)
+        parsed = True
+
+    # rewrite file only if parsing was successful
+    if parsed:
+        with open(os.path.expanduser("~/.ssh/known_hosts"), "w") as knownHostsFile:
+            knownHostsFile.write("\n".join(knownHostsEntries))
+            knownHostsFile.write("\n")
 
 def main():
     """
