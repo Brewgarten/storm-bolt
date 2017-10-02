@@ -1,3 +1,8 @@
+"""
+Copyright (c) IBM 2015-2017. All Rights Reserved.
+Project name: storm-bolt
+This project is licensed under the MIT License, see LICENSE
+"""
 import sys
 
 from setuptools import setup, find_packages
@@ -25,7 +30,7 @@ setup(
         "storm-thunder"
     ],
     keywords = "python storm cloud setup",
-    license = "IBM",
+    license = "MIT",
     name = "storm-bolt",
     packages = find_packages(),
     setup_requires=[] + pytest_runner,

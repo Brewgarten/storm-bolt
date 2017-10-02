@@ -1,5 +1,9 @@
 #!/usr/bin/env python
 """
+Copyright (c) IBM 2015-2017. All Rights Reserved.
+Project name: storm-bolt
+This project is licensed under the MIT License, see LICENSE
+
 This utility provides functionality to provision and configure clusters
 
 """
